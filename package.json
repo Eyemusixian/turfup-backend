@@ -1,0 +1,26 @@
+{
+  "name": "turfup-backend",
+  "version": "1.0.0",
+  "description": "TURFUP - Match finding platform API",
+  "main": "backend.js",
+  "type": "module",
+  "scripts": {
+    "start": "node backend.js",
+    "dev": "node --watch backend.js"
+  },
+  "keywords": [
+    "turfup",
+    "matches",
+    "sports"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "fastify": "^4.26.0",
+    "@fastify/cors": "^9.0.1",
+    "pg": "^8.11.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
