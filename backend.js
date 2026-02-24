@@ -1,6 +1,7 @@
 import fastify from "fastify";
 import fastifyCors from "@fastify/cors";
 import pg from "pg";
+import bcrypt from "bcrypt";
 
 const { Pool } = pg;
 
@@ -21,11 +22,168 @@ pool.query('SELECT NOW()', (err, res) => {
   }
 });
 
+// In-memory session store (use Redis in production)
+const sessions = new Map();
+
+// Helper: Generate session token
+function generateToken() {
+  return 'session_' + Math.random().toString(36).substring(2) + Date.now().toString(36);
+}
+
+// Helper: Get user from session token
+async function getUserFromToken(token) {
+  const userId = sessions.get(token);
+  if (!userId) return null;
+  
+  const result = await pool.query('SELECT id, username, name, contact FROM users WHERE id = $1', [userId]);
+  return result.rows[0] || null;
+}
+
 async function start() {
   try {
     await app.register(fastifyCors, {
-      origin: process.env.FRONTEND_URL || "*", // Allow all origins in development
+      origin: process.env.FRONTEND_URL || "*",
+      credentials: true
     });
+
+    // ===== AUTH ENDPOINTS =====
+
+    // Sign up
+    app.post("/auth/signup", async (request, reply) => {
+      try {
+        const { username, password, name, contact } = request.body;
+
+        if (!username || !password || !name || !contact) {
+          reply.code(400);
+          return { error: "All fields required" };
+        }
+
+        // Check if username exists
+        const existingUser = await pool.query('SELECT id FROM users WHERE username = $1', [username]);
+        if (existingUser.rows.length > 0) {
+          reply.code(400);
+          return { error: "Username already taken" };
+        }
+
+        // Hash password
+        const saltRounds = 10;
+        const passwordHash = await bcrypt.hash(password, saltRounds);
+
+        // Create user
+        const result = await pool.query(
+          'INSERT INTO users (username, password_hash, name, contact) VALUES ($1, $2, $3, $4) RETURNING id, username, name, contact',
+          [username, passwordHash, name, contact]
+        );
+
+        const user = result.rows[0];
+
+        // Create session
+        const token = generateToken();
+        sessions.set(token, user.id);
+
+        return {
+          success: true,
+          token,
+          user: {
+            id: user.id,
+            username: user.username,
+            name: user.name,
+            contact: user.contact
+          }
+        };
+      } catch (err) {
+        console.error("Signup error:", err);
+        reply.code(500);
+        return { error: "Failed to create account" };
+      }
+    });
+
+    // Login
+    app.post("/auth/login", async (request, reply) => {
+      try {
+        const { username, password } = request.body;
+
+        if (!username || !password) {
+          reply.code(400);
+          return { error: "Username and password required" };
+        }
+
+        // Get user
+        const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+        if (result.rows.length === 0) {
+          reply.code(401);
+          return { error: "Invalid username or password" };
+        }
+
+        const user = result.rows[0];
+
+        // Check password
+        const passwordValid = await bcrypt.compare(password, user.password_hash);
+        if (!passwordValid) {
+          reply.code(401);
+          return { error: "Invalid username or password" };
+        }
+
+        // Create session
+        const token = generateToken();
+        sessions.set(token, user.id);
+
+        return {
+          success: true,
+          token,
+          user: {
+            id: user.id,
+            username: user.username,
+            name: user.name,
+            contact: user.contact
+          }
+        };
+      } catch (err) {
+        console.error("Login error:", err);
+        reply.code(500);
+        return { error: "Failed to login" };
+      }
+    });
+
+    // Get current user
+    app.get("/auth/me", async (request, reply) => {
+      try {
+        const token = request.headers.authorization?.replace('Bearer ', '');
+        if (!token) {
+          reply.code(401);
+          return { error: "Not authenticated" };
+        }
+
+        const user = await getUserFromToken(token);
+        if (!user) {
+          reply.code(401);
+          return { error: "Invalid session" };
+        }
+
+        return { user };
+      } catch (err) {
+        console.error("Get user error:", err);
+        reply.code(500);
+        return { error: "Failed to get user" };
+      }
+    });
+
+    // Logout
+    app.post("/auth/logout", async (request, reply) => {
+      try {
+        const token = request.headers.authorization?.replace('Bearer ', '');
+        if (token) {
+          sessions.delete(token);
+        }
+        return { success: true };
+      } catch (err) {
+        console.error("Logout error:", err);
+        reply.code(500);
+        return { error: "Failed to logout" };
+      }
+    });
+
+    // ===== MATCHES ENDPOINTS (existing) =====
 
     // Get all matches
     app.get("/matches", async (request, reply) => {
@@ -122,7 +280,6 @@ async function start() {
 
         const newMatch = result.rows[0];
 
-        // Format response to match frontend expectations
         return {
           id: newMatch.id,
           location: newMatch.location,
@@ -154,7 +311,6 @@ async function start() {
           return { error: "Name and contact required" };
         }
 
-        // Check if match exists and has space
         const matchResult = await pool.query(`
           SELECT m.*, COUNT(p.id) as player_count
           FROM matches m
@@ -175,7 +331,6 @@ async function start() {
           return { error: "Match is full!" };
         }
 
-        // Check if player already joined
         const existingPlayer = await pool.query(`
           SELECT * FROM players WHERE match_id = $1 AND name = $2
         `, [matchId, name]);
@@ -185,13 +340,11 @@ async function start() {
           return { error: "You have already joined this match" };
         }
 
-        // Add player to match
         await pool.query(`
           INSERT INTO players (match_id, name, contact)
           VALUES ($1, $2, $3)
         `, [matchId, name, contact]);
 
-        // Return updated match
         const updatedMatch = await pool.query(`
           SELECT 
             m.*,
@@ -259,10 +412,8 @@ async function start() {
       try {
         const matchId = parseInt(request.params.id);
 
-        // Delete players first (foreign key constraint)
         await pool.query(`DELETE FROM players WHERE match_id = $1`, [matchId]);
 
-        // Delete match
         const result = await pool.query(`
           DELETE FROM matches WHERE id = $1 RETURNING *
         `, [matchId]);
@@ -285,7 +436,12 @@ async function start() {
     
     await app.listen({ port: parseInt(port), host });
     console.log(`🚀 Server running at http://${host}:${port}`);
-    console.log("📝 Endpoints:");
+    console.log("📝 Auth Endpoints:");
+    console.log("   POST   /auth/signup");
+    console.log("   POST   /auth/login");
+    console.log("   GET    /auth/me");
+    console.log("   POST   /auth/logout");
+    console.log("📝 Match Endpoints:");
     console.log("   GET    /matches");
     console.log("   GET    /matches/:id");
     console.log("   POST   /matches");
