@@ -38,7 +38,28 @@ async function getUserFromToken(token) {
   const result = await pool.query('SELECT id, username, name, contact FROM users WHERE id = $1', [userId]);
   return result.rows[0] || null;
 }
+// Auto-delete expired matches (run daily)
+function cleanupExpiredMatches() {
+  const today = new Date().toISOString().split('T')[0]; // Get today's date
+  
+  pool.query(
+    'DELETE FROM matches WHERE date < $1',
+    [today],
+    (err, result) => {
+      if (err) {
+        console.error('Failed to cleanup expired matches:', err);
+      } else {
+        console.log(`✅ Cleaned up ${result.rowCount} expired matches`);
+      }
+    }
+  );
+}
 
+// Run cleanup every 24 hours
+setInterval(cleanupExpiredMatches, 24 * 60 * 60 * 1000);
+
+// Run cleanup on server start
+cleanupExpiredMatches();
 async function start() {
   try {
     await app.register(fastifyCors, {
