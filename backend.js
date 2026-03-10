@@ -56,11 +56,31 @@ function cleanupExpiredMatches() {
   );
 }
 
+// Auto-delete old community posts (older than 7 days)
+function cleanupOldPosts() {
+  const sevenDaysAgo = new Date();
+  sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+  
+  pool.query(
+    'DELETE FROM posts WHERE created_at < $1',
+    [sevenDaysAgo],
+    (err, result) => {
+      if (err) {
+        console.error('Failed to cleanup old posts:', err);
+      } else {
+        console.log(`✅ Cleaned up ${result.rowCount} old posts`);
+      }
+    }
+  );
+}
+
 // Run cleanup every 24 hours
 setInterval(cleanupExpiredMatches, 24 * 60 * 60 * 1000);
+setInterval(cleanupOldPosts, 24 * 60 * 60 * 1000);
 
 // Run cleanup on server start
 cleanupExpiredMatches();
+cleanupOldPosts();
 
 async function start() {
   try {
@@ -306,6 +326,236 @@ async function start() {
         console.error("Update profile error:", err);
         reply.code(500);
         return { error: "Failed to update profile" };
+      }
+    });
+
+    // ===== COMMUNITY ENDPOINTS =====
+
+    // Get all posts (newest first, with comment count)
+    app.get("/posts", async (request, reply) => {
+      try {
+        const result = await pool.query(`
+          SELECT 
+            p.*,
+            u.avatar_url
+          FROM posts p
+          LEFT JOIN users u ON p.user_id = u.id
+          ORDER BY p.created_at DESC
+        `);
+
+        return result.rows;
+      } catch (err) {
+        console.error("Error fetching posts:", err);
+        reply.code(500);
+        return { error: "Failed to fetch posts" };
+      }
+    });
+
+    // Get specific post with comments
+    app.get("/posts/:id", async (request, reply) => {
+      try {
+        const postId = parseInt(request.params.id);
+
+        const postResult = await pool.query(`
+          SELECT 
+            p.*,
+            u.avatar_url
+          FROM posts p
+          LEFT JOIN users u ON p.user_id = u.id
+          WHERE p.id = $1
+        `, [postId]);
+
+        if (postResult.rows.length === 0) {
+          reply.code(404);
+          return { error: "Post not found" };
+        }
+
+        const commentsResult = await pool.query(`
+          SELECT 
+            c.*,
+            u.avatar_url
+          FROM comments c
+          LEFT JOIN users u ON c.user_id = u.id
+          WHERE c.post_id = $1
+          ORDER BY c.created_at ASC
+        `, [postId]);
+
+        return {
+          post: postResult.rows[0],
+          comments: commentsResult.rows
+        };
+      } catch (err) {
+        console.error("Error fetching post:", err);
+        reply.code(500);
+        return { error: "Failed to fetch post" };
+      }
+    });
+
+    // Create new post
+    app.post("/posts", async (request, reply) => {
+      try {
+        const token = request.headers.authorization?.replace('Bearer ', '');
+        if (!token) {
+          reply.code(401);
+          return { error: "Not authenticated" };
+        }
+
+        const user = await getUserFromToken(token);
+        if (!user) {
+          reply.code(401);
+          return { error: "Invalid session" };
+        }
+
+        const { content } = request.body;
+
+        if (!content || content.trim().length === 0) {
+          reply.code(400);
+          return { error: "Content required" };
+        }
+
+        if (content.length > 500) {
+          reply.code(400);
+          return { error: "Content too long (max 500 characters)" };
+        }
+
+        const result = await pool.query(`
+          INSERT INTO posts (user_id, username, content)
+          VALUES ($1, $2, $3)
+          RETURNING *
+        `, [user.id, user.username, content.trim()]);
+
+        return result.rows[0];
+      } catch (err) {
+        console.error("Error creating post:", err);
+        reply.code(500);
+        return { error: "Failed to create post" };
+      }
+    });
+
+    // Delete own post
+    app.delete("/posts/:id", async (request, reply) => {
+      try {
+        const token = request.headers.authorization?.replace('Bearer ', '');
+        if (!token) {
+          reply.code(401);
+          return { error: "Not authenticated" };
+        }
+
+        const user = await getUserFromToken(token);
+        if (!user) {
+          reply.code(401);
+          return { error: "Invalid session" };
+        }
+
+        const postId = parseInt(request.params.id);
+
+        // Check if user owns the post
+        const postCheck = await pool.query('SELECT user_id FROM posts WHERE id = $1', [postId]);
+        if (postCheck.rows.length === 0) {
+          reply.code(404);
+          return { error: "Post not found" };
+        }
+
+        if (postCheck.rows[0].user_id !== user.id) {
+          reply.code(403);
+          return { error: "You can only delete your own posts" };
+        }
+
+        await pool.query('DELETE FROM posts WHERE id = $1', [postId]);
+
+        return { message: "Post deleted successfully" };
+      } catch (err) {
+        console.error("Error deleting post:", err);
+        reply.code(500);
+        return { error: "Failed to delete post" };
+      }
+    });
+
+    // Add comment to post
+    app.post("/posts/:id/comments", async (request, reply) => {
+      try {
+        const token = request.headers.authorization?.replace('Bearer ', '');
+        if (!token) {
+          reply.code(401);
+          return { error: "Not authenticated" };
+        }
+
+        const user = await getUserFromToken(token);
+        if (!user) {
+          reply.code(401);
+          return { error: "Invalid session" };
+        }
+
+        const postId = parseInt(request.params.id);
+        const { content } = request.body;
+
+        if (!content || content.trim().length === 0) {
+          reply.code(400);
+          return { error: "Comment content required" };
+        }
+
+        if (content.length > 300) {
+          reply.code(400);
+          return { error: "Comment too long (max 300 characters)" };
+        }
+
+        // Check if post exists
+        const postCheck = await pool.query('SELECT id FROM posts WHERE id = $1', [postId]);
+        if (postCheck.rows.length === 0) {
+          reply.code(404);
+          return { error: "Post not found" };
+        }
+
+        const result = await pool.query(`
+          INSERT INTO comments (post_id, user_id, username, content)
+          VALUES ($1, $2, $3, $4)
+          RETURNING *
+        `, [postId, user.id, user.username, content.trim()]);
+
+        return result.rows[0];
+      } catch (err) {
+        console.error("Error adding comment:", err);
+        reply.code(500);
+        return { error: "Failed to add comment" };
+      }
+    });
+
+    // Delete own comment
+    app.delete("/comments/:id", async (request, reply) => {
+      try {
+        const token = request.headers.authorization?.replace('Bearer ', '');
+        if (!token) {
+          reply.code(401);
+          return { error: "Not authenticated" };
+        }
+
+        const user = await getUserFromToken(token);
+        if (!user) {
+          reply.code(401);
+          return { error: "Invalid session" };
+        }
+
+        const commentId = parseInt(request.params.id);
+
+        // Check if user owns the comment
+        const commentCheck = await pool.query('SELECT user_id FROM comments WHERE id = $1', [commentId]);
+        if (commentCheck.rows.length === 0) {
+          reply.code(404);
+          return { error: "Comment not found" };
+        }
+
+        if (commentCheck.rows[0].user_id !== user.id) {
+          reply.code(403);
+          return { error: "You can only delete your own comments" };
+        }
+
+        await pool.query('DELETE FROM comments WHERE id = $1', [commentId]);
+
+        return { message: "Comment deleted successfully" };
+      } catch (err) {
+        console.error("Error deleting comment:", err);
+        reply.code(500);
+        return { error: "Failed to delete comment" };
       }
     });
 
@@ -571,6 +821,13 @@ async function start() {
     console.log("   GET    /users/:username");
     console.log("   GET    /users/:username/stats");
     console.log("   PUT    /profile");
+    console.log("📝 Community Endpoints:");
+    console.log("   GET    /posts");
+    console.log("   GET    /posts/:id");
+    console.log("   POST   /posts");
+    console.log("   DELETE /posts/:id");
+    console.log("   POST   /posts/:id/comments");
+    console.log("   DELETE /comments/:id");
     console.log("📝 Match Endpoints:");
     console.log("   GET    /matches");
     console.log("   GET    /matches/:id");
