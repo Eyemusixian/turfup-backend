@@ -38,6 +38,7 @@ async function getUserFromToken(token) {
   const result = await pool.query('SELECT id, username, name, contact FROM users WHERE id = $1', [userId]);
   return result.rows[0] || null;
 }
+
 // Auto-delete expired matches (run daily)
 function cleanupExpiredMatches() {
   const today = new Date().toISOString().split('T')[0]; // Get today's date
@@ -60,6 +61,7 @@ setInterval(cleanupExpiredMatches, 24 * 60 * 60 * 1000);
 
 // Run cleanup on server start
 cleanupExpiredMatches();
+
 async function start() {
   try {
     await app.register(fastifyCors, {
@@ -201,6 +203,109 @@ async function start() {
         console.error("Logout error:", err);
         reply.code(500);
         return { error: "Failed to logout" };
+      }
+    });
+
+    // ===== PROFILE ENDPOINTS =====
+
+    // Get user profile by username
+    app.get("/users/:username", async (request, reply) => {
+      try {
+        const { username } = request.params;
+
+        const result = await pool.query(
+          'SELECT id, username, name, bio, avatar_url, location, favorite_position, skill_level, created_at FROM users WHERE username = $1',
+          [username]
+        );
+
+        if (result.rows.length === 0) {
+          reply.code(404);
+          return { error: "User not found" };
+        }
+
+        return result.rows[0];
+      } catch (err) {
+        console.error("Get profile error:", err);
+        reply.code(500);
+        return { error: "Failed to get profile" };
+      }
+    });
+
+    // Get user stats (matches created/joined)
+    app.get("/users/:username/stats", async (request, reply) => {
+      try {
+        const { username } = request.params;
+
+        // Get user
+        const userResult = await pool.query('SELECT id, name FROM users WHERE username = $1', [username]);
+        if (userResult.rows.length === 0) {
+          reply.code(404);
+          return { error: "User not found" };
+        }
+
+        const user = userResult.rows[0];
+
+        // Count matches created
+        const createdResult = await pool.query(
+          'SELECT COUNT(*) as count FROM matches WHERE creator_name = $1',
+          [user.name]
+        );
+
+        // Count matches joined
+        const joinedResult = await pool.query(
+          'SELECT COUNT(*) as count FROM players WHERE name = $1',
+          [user.name]
+        );
+
+        const matchesCreated = parseInt(createdResult.rows[0].count);
+        const matchesJoined = parseInt(joinedResult.rows[0].count);
+
+        return {
+          matchesCreated,
+          matchesJoined,
+          totalMatches: matchesCreated + matchesJoined
+        };
+      } catch (err) {
+        console.error("Get stats error:", err);
+        reply.code(500);
+        return { error: "Failed to get stats" };
+      }
+    });
+
+    // Update own profile
+    app.put("/profile", async (request, reply) => {
+      try {
+        const token = request.headers.authorization?.replace('Bearer ', '');
+        if (!token) {
+          reply.code(401);
+          return { error: "Not authenticated" };
+        }
+
+        const user = await getUserFromToken(token);
+        if (!user) {
+          reply.code(401);
+          return { error: "Invalid session" };
+        }
+
+        const { bio, avatar_url, location, favorite_position, skill_level } = request.body;
+
+        const result = await pool.query(
+          `UPDATE users 
+           SET bio = COALESCE($1, bio),
+               avatar_url = COALESCE($2, avatar_url),
+               location = COALESCE($3, location),
+               favorite_position = COALESCE($4, favorite_position),
+               skill_level = COALESCE($5, skill_level)
+           WHERE id = $6
+           RETURNING id, username, name, bio, avatar_url, location, favorite_position, skill_level`,
+          [bio, avatar_url, location, favorite_position, skill_level, user.id]
+        );
+
+        return result.rows[0];
+      } catch (err) {
+        console.error("Update profile error:", err);
+        reply.code(500);
+        return { error: "Failed to update profile" };
       }
     });
 
@@ -462,6 +567,10 @@ async function start() {
     console.log("   POST   /auth/login");
     console.log("   GET    /auth/me");
     console.log("   POST   /auth/logout");
+    console.log("📝 Profile Endpoints:");
+    console.log("   GET    /users/:username");
+    console.log("   GET    /users/:username/stats");
+    console.log("   PUT    /profile");
     console.log("📝 Match Endpoints:");
     console.log("   GET    /matches");
     console.log("   GET    /matches/:id");
